@@ -24,7 +24,7 @@ CACHE_DELETE_EXPIRE_COMPLETE = "expire_complete"
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="daemon for executing ddns updates using nsupdate")
+    p = argparse.ArgumentParser(description="daemon for executing jobs with limited queue")
     p.add_argument("-c", "--config", type=str, default=DEFAULT_CFG_PATH, help="path to config file")
     return p.parse_args()
 
@@ -52,12 +52,18 @@ class RequestHandler(DatagramRequestHandler):
         data = self.request[0].strip()
         log.debug("got request: %s", data)
 
-        if data in cache:
+        try:
+            cmd = Command.from_data(data)
+        except ValueError as err:
+            log.error("parse data: %s", err)
+            return
+
+        if cmd.key in cache:
             log.info("skip command: already in cache")
             return
 
         try:
-            queue.put(data, block=False, timeout=1)
+            queue.put(cmd, block=False, timeout=1)
         except Queue.Full:
             log.error("queue limit is exceeded")
             return
@@ -83,27 +89,14 @@ class Worker(threading.Thread):
 
     def run(self):
         while True:
-            data = self.queue.get()
-            self.cache[data] = None
-            self.process(data)
-            del self.cache[data]
+            cmd = self.queue.get()
+            self.cache[cmd.key] = None
+            self.process(cmd)
+            del self.cache[cmd.key]
 
-    def process(self, data):
-        log.info("exec  : %s", data)
-        cmd = shlex.split(data)
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        (stdout, stderr) = p.communicate()
-
-        for line in stdout.split("\n"):
-            if line:
-                log.info("stdout: %s", line)
-
-        for line in stderr.split("\n"):
-            if line:
-                log.info("stderr: %s", line)
-
-        if p.returncode != 0:
-            log.error("exec  : %s failed with %d", data, p.returncode)
+    def process(self, cmd):
+        log.info("exec  : %s", cmd)
+        cmd.execute()
 
 
 class Cache(object):
@@ -136,9 +129,48 @@ class Cache(object):
         return self.cache.__contains__(key)
 
 
+class Command(object):
+    def __init__(self, args):
+        self.args = args
+
+    def __str__(self):
+        return "{}".format(" ".join(self.args))
+
+    @property
+    def key(self):
+        return str(self)
+
+    def execute(self):
+        p = subprocess.Popen(self.args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        (stdout, stderr) = p.communicate()
+
+        for line in stdout.split("\n"):
+            if line:
+                log.info("stdout: %s", line)
+
+        for line in stderr.split("\n"):
+            if line:
+                log.info("stderr: %s", line)
+
+        if p.returncode != 0:
+            log.error("exec  : %s failed with %d", self.args, p.returncode)
+
+    @classmethod
+    def from_data(cls, data):
+        cmd = shlex.split(data)
+        if not cmd:
+            raise ValueError("unable to parse data")
+
+        name = cmd[0]
+        args = cmd[1:]
+        executable = config.job_executable(name)
+
+        return cls(args=[executable] + args)
+
+
 class Config(object):
     def __init__(self, socket, workers, log_debug, log_datetime, queue_size, cache_delete_mode,
-                 cache_expire):
+                 cache_expire, jobs):
         self.socket = socket
         self.workers = workers
         self.log_debug = log_debug
@@ -146,6 +178,7 @@ class Config(object):
         self.queue_size = queue_size
         self.cache_delete_mode = cache_delete_mode
         self.cache_expire = cache_expire
+        self.jobs = jobs
 
     @classmethod
     def from_file(cls, path):
@@ -156,6 +189,13 @@ class Config(object):
                                      CACHE_DELETE_EXPIRE_COMPLETE):
             raise ValueError("wrong cache_delete_mode value")
 
+        jobs = {}
+        for k, v in c.items("jobs"):
+            jobs[k] = v
+
+        if not jobs:
+            raise ValueError("no jobs defined in config")
+
         return cls(
             socket=c.get("main", "socket"),
             workers=c.getint("main", "workers"),
@@ -164,7 +204,14 @@ class Config(object):
             queue_size=c.getint("main", "queue_size"),
             cache_delete_mode=cache_delete_mode,
             cache_expire=c.getint("main", "cache_expire"),
+            jobs=jobs,
         )
+
+    def job_executable(self, name):
+        if name not in self.jobs:
+            raise ValueError("job '%s' not configured" % name)
+
+        return self.jobs[name]
 
 
 if __name__ == "__main__":
@@ -173,7 +220,7 @@ if __name__ == "__main__":
 
     log = configure_logger(config.log_debug, config.log_datetime)
 
-    log.debug("load configuration from %s", args.config)
+    log.debug("load configuration from %s, %d jobs loaded", args.config, len(config.jobs))
 
     signal.signal(signal.SIGTERM, signal_handler)
 
