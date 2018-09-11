@@ -91,12 +91,8 @@ class Worker(threading.Thread):
         while True:
             cmd = self.queue.get()
             self.cache[cmd.key] = None
-            self.process(cmd)
+            cmd.execute()
             del self.cache[cmd.key]
-
-    def process(self, cmd):
-        log.info("exec  : %s", cmd)
-        cmd.execute()
 
 
 class Cache(object):
@@ -141,6 +137,7 @@ class Command(object):
         return str(self)
 
     def execute(self):
+        log.info("exec  : %s", self.args)
         p = subprocess.Popen(self.args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         (stdout, stderr) = p.communicate()
 
