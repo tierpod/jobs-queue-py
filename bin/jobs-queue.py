@@ -186,9 +186,7 @@ class Config(object):
                                      CACHE_DELETE_EXPIRE_COMPLETE):
             raise ValueError("wrong cache_delete_mode value")
 
-        jobs = {}
-        for k, v in c.items("jobs"):
-            jobs[k] = v
+        jobs = dict(c.items("jobs"))
 
         if not jobs:
             raise ValueError("no jobs defined in config")
