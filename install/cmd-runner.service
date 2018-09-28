@@ -1,0 +1,13 @@
+[Unit]
+Description=Command runner with limits
+
+[Service]
+; User=user
+; Group=user
+Environment=PYTHONUNBUFFERED=true
+WorkingDirectory=/opt/command-runner
+ExecStart=/opt/command-runner/cmd_runner.py --config ./config.ini
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
