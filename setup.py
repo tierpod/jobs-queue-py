@@ -4,9 +4,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="jobs-queue",
+    name="command-runner",
     version="0.1",
-    description="jobs queue with limiter",
+    description="Run commands from queue with limits",
     author="Pavel Podkorytov",
     author_email="pod.pavel@gmail.com",
     classifiers=[
@@ -15,7 +15,7 @@ setup(
         "Programming Language :: Python :: 3",
     ],
     packages=find_packages(),
-    scripts=["bin/jobs-queue.py"],
+    scripts=["bin/cmd_runner.py"],
     install_requires=[
         "cachetools",
     ]
