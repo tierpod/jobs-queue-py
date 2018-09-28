@@ -18,6 +18,9 @@ from SocketServer import UnixDatagramServer, DatagramRequestHandler
 
 import cachetools
 
+log = logging.getLogger()
+cache = None
+queue = None
 
 DEFAULT_CFG_PATH = "/etc/cmd-runner.ini"
 
@@ -52,11 +55,11 @@ def signal_handler(*args):
 
 class RequestHandler(DatagramRequestHandler):
     def handle(self):
-        data = self.request[0].strip()
-        log.debug("got request: %s", data)
+        cmd_line = self.request[0].strip()
+        log.debug("got request: %s", cmd_line)
 
         try:
-            cmd = Command.from_data(data)
+            cmd = Command.from_str(cmd_line)
         except ValueError as err:
             log.error("parse data: %s", err)
             return
@@ -82,17 +85,22 @@ class RequestHandler(DatagramRequestHandler):
 
 
 class Worker(threading.Thread):
-    def __init__(self, name, queue, cache):
+    def __init__(self, name, queue, cache, cmd_list):
         super(Worker, self).__init__(name=name)
         self.daemon = True
 
         log.info("start worker %s", self.name)
         self.queue = queue
         self.cache = cache
+        self.cmd_list = cmd_list
 
     def run(self):
         while True:
             cmd = self.queue.get()
+            if cmd.executable not in self.cmd_list:
+                log.warning("skip command '%s': not in the commands list", cmd.executable)
+                return
+
             self.cache[cmd.key] = None
             cmd.execute()
             del self.cache[cmd.key]
@@ -129,15 +137,24 @@ class Cache(object):
 
 
 class Command(object):
+    """Args:
+        args (list of str): list of command line arguments.
+
+    >>> cmd = Command.from_str("/bin/sleep 10")
+    >>> print(cmd)
+    Command(executable=/bin/sleep args=['/bin/sleep', '10'])
+    """
+
     def __init__(self, args):
+        self.executable = args[0]
         self.args = args
 
     def __str__(self):
-        return "{}".format(" ".join(self.args))
+        return "Command(executable={} args={})".format(self.executable, self.args)
 
     @property
     def key(self):
-        return str(self)
+        return "{}".format(" ".join(self.args))
 
     def execute(self):
         log.info("exec  : %s", self.args)
@@ -156,16 +173,12 @@ class Command(object):
             log.error("exec  : %s failed with %d", self.args, p.returncode)
 
     @classmethod
-    def from_data(cls, data):
-        cmd = shlex.split(data)
+    def from_str(cls, s):
+        cmd = shlex.split(s)
         if not cmd:
             raise ValueError("unable to parse data")
 
-        name = cmd[0]
-        args = cmd[1:]
-        executable = config.get_command(name)
-
-        return cls(args=[executable] + args)
+        return cls(args=cmd)
 
 
 class Config(object):
@@ -182,14 +195,16 @@ class Config(object):
 
     @classmethod
     def from_file(cls, path):
-        c = ConfigParser.ConfigParser()
+        c = ConfigParser.ConfigParser(allow_no_value=True)
         c.read(path)
         cache_delete_mode = c.get("main", "cache_delete_mode")
         if cache_delete_mode not in (CACHE_DELETE_EXPIRE, CACHE_DELETE_COMPLETE,
                                      CACHE_DELETE_EXPIRE_COMPLETE):
             raise ValueError("wrong cache_delete_mode value")
 
-        commands = dict(c.items("commands"))
+        commands = []
+        for k, _ in c.items("commands"):
+            commands.append(k)
 
         if not commands:
             raise ValueError("no commands defined in config")
@@ -205,36 +220,39 @@ class Config(object):
             commands=commands,
         )
 
-    def get_command(self, name):
-        if name not in self.commands:
-            raise ValueError("command '%s' not configured" % name)
 
-        return self.commands[name]
-
-
-if __name__ == "__main__":
+def main():
     args = parse_args()
     config = Config.from_file(args.config)
 
+    global log  # pylint: disable=W0603
     log = configure_logger(config.log_debug, config.log_datetime)
 
     log.debug("load configuration from %s, %d commands loaded", args.config, len(config.commands))
 
     signal.signal(signal.SIGTERM, signal_handler)
 
+    global cache  # pylint: disable=W0603
     cache = Cache(mode=config.cache_delete_mode, maxsize=config.queue_size, ttl=config.cache_expire)
 
+    global queue  # pylint: disable=W0603
     queue = Queue.Queue(maxsize=config.queue_size)
+
     for i in range(1, config.workers + 1):
-        worker = Worker(name="Worker-%d" % i, queue=queue, cache=cache)
+        worker = Worker(name="Worker-%d" % i, queue=queue, cache=cache, cmd_list=config.commands)
         worker.start()
 
     log.info("listen unix socket on %s", config.socket)
-    listen = UnixDatagramServer(config.socket, RequestHandler)
+    server = UnixDatagramServer(config.socket, RequestHandler)
+
     try:
-        listen.serve_forever()
+        server.serve_forever()
     except KeyboardInterrupt:
         log.info("shutting down server")
         exit(0)
     finally:
         os.unlink(config.socket)
+
+
+if __name__ == "__main__":
+    main()
