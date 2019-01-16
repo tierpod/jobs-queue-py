@@ -104,6 +104,7 @@ class Worker(threading.Thread):
             self.cache[cmd.key] = None
             cmd.execute()
             del self.cache[cmd.key]
+            self.queue.task_done()
 
 
 class Cache(object):
