@@ -6,21 +6,21 @@
 """
 
 import argparse
-import ConfigParser
+import configparser
 import logging
 import os
-import Queue
+import queue
 import shlex
 import signal
 import subprocess
 import threading
-from SocketServer import UnixDatagramServer, DatagramRequestHandler
+from socketserver import UnixDatagramServer, DatagramRequestHandler
 
 import cachetools
 
 log = logging.getLogger()
 cache = None
-queue = None
+cmds_queue = None
 
 DEFAULT_CFG_PATH = "/etc/cmd-runner.ini"
 
@@ -55,7 +55,7 @@ def signal_handler(*args):
 
 class RequestHandler(DatagramRequestHandler):
     def handle(self):
-        cmd_line = self.request[0].strip()
+        cmd_line = self.request[0].strip().decode()
         log.debug("got request: %s", cmd_line)
 
         try:
@@ -69,8 +69,8 @@ class RequestHandler(DatagramRequestHandler):
             return
 
         try:
-            queue.put(cmd, block=False, timeout=1)
-        except Queue.Full:
+            cmds_queue.put(cmd, block=False, timeout=1)
+        except queue.Full:
             log.error("queue limit is exceeded")
             return
 
@@ -85,18 +85,18 @@ class RequestHandler(DatagramRequestHandler):
 
 
 class Worker(threading.Thread):
-    def __init__(self, name, queue, cache, cmd_list):
+    def __init__(self, name, cmds_queue, cache, cmd_list):
         super(Worker, self).__init__(name=name)
         self.daemon = True
 
         log.info("start worker %s", self.name)
-        self.queue = queue
+        self.cmds_queue = cmds_queue
         self.cache = cache
         self.cmd_list = cmd_list
 
     def run(self):
         while True:
-            cmd = self.queue.get()
+            cmd = self.cmds_queue.get()
             if cmd.executable not in self.cmd_list:
                 log.warning("skip command '%s': not in the commands list", cmd.executable)
                 return
@@ -104,7 +104,7 @@ class Worker(threading.Thread):
             self.cache[cmd.key] = None
             cmd.execute()
             del self.cache[cmd.key]
-            self.queue.task_done()
+            self.cmds_queue.task_done()
 
 
 class Cache(object):
@@ -159,7 +159,7 @@ class Command(object):
 
     def execute(self):
         log.info("exec  : %s", self.args)
-        p = subprocess.Popen(self.args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.Popen(self.args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8")
         (stdout, stderr) = p.communicate()
 
         for line in stdout.split("\n"):
@@ -196,7 +196,7 @@ class Config(object):
 
     @classmethod
     def from_file(cls, path):
-        c = ConfigParser.ConfigParser(allow_no_value=True)
+        c = configparser.ConfigParser(allow_no_value=True)
         c.read(path)
         cache_delete_mode = c.get("main", "cache_delete_mode")
         if cache_delete_mode not in (CACHE_DELETE_EXPIRE, CACHE_DELETE_COMPLETE,
@@ -236,11 +236,12 @@ def main():
     global cache  # pylint: disable=W0603
     cache = Cache(mode=config.cache_delete_mode, maxsize=config.queue_size, ttl=config.cache_expire)
 
-    global queue  # pylint: disable=W0603
-    queue = Queue.Queue(maxsize=config.queue_size)
+    global cmds_queue  # pylint: disable=W0603
+    cmds_queue = queue.Queue(maxsize=config.queue_size)
 
     for i in range(1, config.workers + 1):
-        worker = Worker(name="Worker-%d" % i, queue=queue, cache=cache, cmd_list=config.commands)
+        worker = Worker(name="Worker-%d" % i, cmds_queue=cmds_queue, cache=cache,
+                        cmd_list=config.commands)
         worker.start()
 
     log.info("listen unix socket on %s", config.socket)
