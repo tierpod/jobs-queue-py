@@ -1,5 +1,5 @@
 venv:
-	virtualenv -p /usr/bin/python2 $@
+	virtualenv -p /usr/bin/python3 $@
 
 .PHONY: init-dev
 init-dev:

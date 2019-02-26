@@ -1,2 +1,2 @@
 flake8
-pylint<2
+pylint
