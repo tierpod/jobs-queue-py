@@ -11,8 +11,10 @@ import configparser
 import logging
 import os
 import shlex
+import signal
 from asyncio import StreamReader, StreamWriter
 from enum import Enum
+from functools import partial
 from typing import List
 
 
@@ -53,7 +55,10 @@ async def log_output(fh: StreamReader, prefix: str) -> None:
     """Log output from `fh` with prefix `prefix`"""
 
     while True:
-        line = await fh.readline()
+        try:
+            line = await fh.readline()
+        except asyncio.CancelledError:
+            break
         if not line:
             break
         log.info("%s: %s", prefix, line.decode().strip())
@@ -166,7 +171,12 @@ class RequestHandler(object):
         self.loop.create_task(log_output(p.stdout, "stdout"))
         self.loop.create_task(log_output(p.stderr, "stderr"))
 
-        await p.wait()
+        try:
+            await p.wait()
+        except asyncio.CancelledError:
+            p.terminate()
+            log.info("subprocess pid=%d is terminated", p.pid)
+            return
         if p.returncode != 0:
             log.error("exec  : %s failed with exit code %d", cmd, p.returncode)
         self.cache.remove(cmd)
@@ -213,6 +223,14 @@ class Config(object):
         )
 
 
+async def shutdown(loop):
+    log.info("shutting down server (SIGTERM)")
+    tasks = [t for t in asyncio.Task.all_tasks() if t is not asyncio.tasks.Task.current_task()]
+    [t.cancel() for t in tasks]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
+
+
 def main():
     args = parse_args()
     cfg = Config.from_ini(args.config)
@@ -229,12 +247,13 @@ def main():
     handler_coro = asyncio.start_unix_server(request_handler.handle, path=cfg.socket)
     server = loop.run_until_complete(handler_coro)
 
+    loop.add_signal_handler(signal.SIGTERM, partial(asyncio.ensure_future, shutdown(loop)))
+
     log.info("listen unix socket on %s", cfg.socket)
     try:
         loop.run_forever()
     except KeyboardInterrupt:
         log.info("shutting down server")
-    finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
 
     # close the server
