@@ -12,7 +12,7 @@ import logging
 import os
 import shlex
 import signal
-from asyncio import StreamReader, StreamWriter
+from asyncio import StreamReader, StreamWriter, Queue, QueueFull
 from enum import Enum
 from functools import partial
 from typing import List
@@ -78,18 +78,15 @@ class Cache(object):
         return "Cache(mode={mode}, size={size}/{maxsize})".format(
             mode=self.mode, size=len(self._cache), maxsize=self.maxsize)
 
+    def __contains__(self, item) -> bool:
+        return item in self._cache
+
     def append(self, item: str) -> None:
-        """Append `item` to cache.
-
-        Raises:
-            ValueError: if unable to append item to cache.
-        """
-
-        if item in self._cache:
-            raise ValueError("already in cache")
+        """Append `item` to cache"""
 
         if len(self._cache) >= self.maxsize:
-            raise ValueError("cache limit is exceeded")
+            log.error("cache limit is exceeded")
+            return
 
         log.debug("%s append %s", self, item)
         self._cache.append(item)
@@ -110,53 +107,40 @@ class Cache(object):
             self._remove(item)
 
 
-def limited(func):
-    async def wrap(self, *args, **kwargs):
-        self._running += 1
-        await func(self, *args, **kwargs)
-        self._running -= 1
-    return wrap
-
-
 class Worker(object):
 
-    def __init__(self, cache: Cache, allowed_commands: List[str], running_limit: int):
+    def __init__(self, name: str, cache: Cache, allowed_commands: List[str], queue: Queue):
+        self.name = name
         self.cache = cache
         self.allowed_commands = allowed_commands
-        self.running_limit = running_limit
+        self.queue = queue
+        self.shutdown = asyncio.Event()
         self._loop = asyncio.get_event_loop()
-        self._running = 0
 
-    def is_limit_exceeded(self):
-        return self._running >= self.running_limit
+    async def run(self) -> None:
+        while not self.shutdown.is_set():
+            cmd = await self.queue.get()
+            try:
+                await self.exec(cmd)
+            finally:
+                self.queue.task_done()
 
-    async def exec(self, cmd: str) -> Answer:
-        """Validate `cmd` and execute it"""
+        else:
+            log.debug("(%s) worker shutdown", self.name)
 
-        log.info("exec  : %s", cmd)
+    async def exec(self, cmd: str) -> None:
+        log.info("(%s) exec  : %s", self.name, cmd)
 
         name, *opts = shlex.split(cmd)
         if name not in self.allowed_commands:
-            log.warning("skip command '%s': not in the allowed commands list", name)
-            return Answer.SKIP
+            log.warning("(%s) skip command '%s': not in the allowed commands list", self.name, name)
+            return
 
-        if self.is_limit_exceeded():
-            log.error("maximum number of running workers exceeded: %d/%d", self._running,
-                      self.running_limit)
-            return Answer.SKIP
+        self.cache.append(cmd)
+        log.info("(%s) exec  : %s", self.name, cmd)
+        await self._wait_and_log(cmd, name, opts)
+        self.cache.remove(cmd)
 
-        try:
-            self.cache.append(cmd)
-        except ValueError as err:
-            log.error(err)
-            return Answer.SKIP
-
-        # don't wait for complete process inside this coroutine, create another one
-        self._loop.create_task(self._wait_and_log(cmd, name, opts))
-
-        return Answer.OK
-
-    @limited
     async def _wait_and_log(self, cmd: str, name: str, opts: List[str]) -> None:
         try:
             p = await asyncio.create_subprocess_exec(
@@ -165,43 +149,60 @@ class Worker(object):
             log.error(err)
             return
 
-        self._loop.create_task(log_output(p.stdout, "stdout"))
-        self._loop.create_task(log_output(p.stderr, "stderr"))
+        self._loop.create_task(log_output(p.stdout, f"({self.name}) stdout"))
+        self._loop.create_task(log_output(p.stderr, f"({self.name}) stderr"))
 
         try:
             await p.wait()
         except asyncio.CancelledError:
             p.terminate()
-            log.info("subprocess pid=%d is terminated", p.pid)
+            log.info("(%s) subprocess pid=%d was terminated", self.name, p.pid)
             return
         if p.returncode != 0:
-            log.error("exec  : %s failed with exit code %d", cmd, p.returncode)
-        self.cache.remove(cmd)
+            log.error("(%s) exec  : %s failed with exit code %d", self.name, cmd, p.returncode)
 
 
 class RequestHandler(object):
 
-    def __init__(self, worker: Worker):
-        self.worker = worker
+    def __init__(self, queue: Queue, cache: Cache):
+        self.queue = queue
+        self.cache = cache
 
     async def handle(self, reader: StreamReader, writer: StreamWriter) -> None:
         raw_data = await reader.readline()
         cmd_line = raw_data.decode().strip()
         log.debug("got request: %s", cmd_line)
 
-        answer = await self.worker.exec(cmd_line)
+        if not cmd_line:
+            log.error("unable to parse parse data: '%s'", cmd_line)
+            await self.reply(writer, Answer.SKIP)
+            return
 
+        if cmd_line in self.cache:
+            log.error("skip: already in commands cache")
+            await self.reply(writer, Answer.SKIP)
+            return
+
+        try:
+            self.queue.put_nowait(cmd_line)
+        except QueueFull:
+            log.error("skip: queue limit is exceeded")
+            await self.reply(writer, Answer.SKIP)
+            return
+
+        await self.reply(writer, Answer.OK)
+
+    async def reply(self, writer: StreamWriter, answer: Answer) -> None:
         log.debug("send reply: %s", answer)
         writer.write(answer.value)
         await writer.drain()
-
         log.debug("close client connection")
         writer.close()
 
 
 class Config(object):
     def __init__(self, socket: str, log_debug: bool, log_datetime: bool, cache_maxsize: int,
-                 cache_delete_mode: CacheDeleteMode, cache_ttl: int, running_limit: int,
+                 cache_delete_mode: CacheDeleteMode, cache_ttl: int, workers: int,
                  commands: List[str]):
         self.socket = socket
         self.log_debug = log_debug
@@ -209,7 +210,7 @@ class Config(object):
         self.cache_maxsize = cache_maxsize
         self.cache_delete_mode = cache_delete_mode
         self.cache_ttl = cache_ttl
-        self.running_limit = running_limit
+        self.workers = workers
         self.commands = commands
 
     @classmethod
@@ -234,15 +235,19 @@ class Config(object):
             cache_maxsize=c.getint("main", "cache_maxsize"),
             cache_delete_mode=cache_delete_mode,
             cache_ttl=c.getint("main", "cache_ttl"),
-            running_limit=c.getint("main", "running_limit"),
+            workers=c.getint("main", "workers"),
             commands=commands,
         )
 
 
-def shutdown(signum=None):
+def shutdown(workers, signum=None):
     loop = asyncio.get_event_loop()
     log.info("shutting down server (%s)", signum)
     loop.stop()
+    # shutdown all workers
+    for w in workers:
+        w.shutdown.set()
+    # shutdown all pending coroutines
     pending = asyncio.Task.all_tasks()
     [t.cancel() for t in pending]
     asyncio.ensure_future(asyncio.gather(*pending, return_exceptions=True))
@@ -259,12 +264,21 @@ def main():
 
     loop = asyncio.get_event_loop()
     cache = Cache(mode=cfg.cache_delete_mode, maxsize=cfg.cache_maxsize, ttl=cfg.cache_ttl)
-    worker = Worker(allowed_commands=cfg.commands, cache=cache, running_limit=cfg.running_limit)
-    request_handler = RequestHandler(worker=worker)
+    queue = Queue(maxsize=cfg.workers)
+    request_handler = RequestHandler(queue=queue, cache=cache)
+
+    # start asynchronous workers
+    workers = []
+    for i in range(cfg.workers):
+        w = Worker(name=f"Worker-{i+1}", allowed_commands=cfg.commands, cache=cache, queue=queue)
+        loop.create_task(w.run())
+        workers.append(w)
+
+    # start asynchronous server
     handler_coro = asyncio.start_unix_server(request_handler.handle, path=cfg.socket)
     server = loop.run_until_complete(handler_coro)
 
-    loop.add_signal_handler(signal.SIGTERM, partial(shutdown, "TERM"))
+    loop.add_signal_handler(signal.SIGTERM, partial(shutdown, workers, "TERM"))
 
     log.info("listen unix socket on %s", cfg.socket)
     try:
