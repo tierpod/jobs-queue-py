@@ -104,47 +104,34 @@ class Cache(object):
             log.debug("%s remove %s", self, item)
 
     def remove(self, item: str) -> None:
-        """ Remove `item` from cache"""
+        """Remove `item` from cache"""
 
         if self.mode is CacheDeleteMode.COMPLETE or self.mode is CacheDeleteMode.EXPIRE_COMPLETE:
             self._remove(item)
 
 
-class RequestHandler(object):
+class Worker(object):
 
-    def __init__(self, allowed_commands: List[str], cache: Cache, workers: int):
-        self.loop = asyncio.get_event_loop()
-        self.allowed_commands = allowed_commands
+    def __init__(self, cache: Cache, allowed_commands: List[str], running_limit: int):
         self.cache = cache
-        self.workers = workers
-        self._running: int = 0
-
-    async def handle(self, reader: StreamReader, writer: StreamWriter) -> None:
-        raw_data = await reader.readline()
-        cmd_line = raw_data.decode().strip()
-        log.debug("got request: %s", cmd_line)
-
-        log.info("exec  : %s", cmd_line)
-        answer = await self.exec(cmd_line)
-
-        log.debug("send reply: %s", answer)
-        writer.write(answer.value)
-        await writer.drain()
-
-        log.debug("close client connection")
-        writer.close()
+        self.allowed_commands = allowed_commands
+        self.running_limit = running_limit
+        self._loop = asyncio.get_event_loop()
+        self._running = 0
 
     async def exec(self, cmd: str) -> Answer:
         """Validate `cmd` and execute it"""
+
+        log.info("exec  : %s", cmd)
 
         name, *args = shlex.split(cmd)
         if name not in self.allowed_commands:
             log.warning("skip command '%s': not in the allowed commands list", name)
             return Answer.SKIP
 
-        if self._running >= self.workers:
+        if self._running >= self.running_limit:
             log.error("maximum number of running workers exceeded: %d/%d", self._running,
-                      self.workers)
+                      self.running_limit)
             return Answer.SKIP
 
         try:
@@ -154,11 +141,11 @@ class RequestHandler(object):
             return Answer.SKIP
 
         # don't wait for complete process inside this coroutine, create another one
-        self.loop.create_task(self._exec_and_log(cmd, name, args))
+        self._loop.create_task(self._wait_and_log(cmd, name, args))
 
         return Answer.OK
 
-    async def _exec_and_log(self, cmd: str, name: str, args: List[str]) -> None:
+    async def _wait_and_log(self, cmd, name, args) -> None:
         try:
             p = await asyncio.create_subprocess_exec(
                 name, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -168,8 +155,8 @@ class RequestHandler(object):
 
         self._running += 1
 
-        self.loop.create_task(log_output(p.stdout, "stdout"))
-        self.loop.create_task(log_output(p.stderr, "stderr"))
+        self._loop.create_task(log_output(p.stdout, "stdout"))
+        self._loop.create_task(log_output(p.stderr, "stderr"))
 
         try:
             await p.wait()
@@ -183,9 +170,29 @@ class RequestHandler(object):
         self._running -= 1
 
 
+class RequestHandler(object):
+
+    def __init__(self, worker: Worker):
+        self.worker = worker
+
+    async def handle(self, reader: StreamReader, writer: StreamWriter) -> None:
+        raw_data = await reader.readline()
+        cmd_line = raw_data.decode().strip()
+        log.debug("got request: %s", cmd_line)
+
+        answer = await self.worker.exec(cmd_line)
+
+        log.debug("send reply: %s", answer)
+        writer.write(answer.value)
+        await writer.drain()
+
+        log.debug("close client connection")
+        writer.close()
+
+
 class Config(object):
     def __init__(self, socket: str, log_debug: bool, log_datetime: bool, cache_maxsize: int,
-                 cache_delete_mode: CacheDeleteMode, cache_ttl: int, workers: int,
+                 cache_delete_mode: CacheDeleteMode, cache_ttl: int, running_limit: int,
                  commands: List[str]):
         self.socket = socket
         self.log_debug = log_debug
@@ -193,7 +200,7 @@ class Config(object):
         self.cache_maxsize = cache_maxsize
         self.cache_delete_mode = cache_delete_mode
         self.cache_ttl = cache_ttl
-        self.workers = workers
+        self.running_limit = running_limit
         self.commands = commands
 
     @classmethod
@@ -218,17 +225,18 @@ class Config(object):
             cache_maxsize=c.getint("main", "cache_maxsize"),
             cache_delete_mode=cache_delete_mode,
             cache_ttl=c.getint("main", "cache_ttl"),
-            workers=c.getint("main", "workers"),
+            running_limit=c.getint("main", "running_limit"),
             commands=commands,
         )
 
 
-async def shutdown(loop):
-    log.info("shutting down server (SIGTERM)")
-    tasks = [t for t in asyncio.Task.all_tasks() if t is not asyncio.tasks.Task.current_task()]
-    [t.cancel() for t in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True)
+def shutdown(signum=None):
+    loop = asyncio.get_event_loop()
+    log.info("shutting down server (%s)", signum)
     loop.stop()
+    pending = asyncio.Task.all_tasks()
+    [t.cancel() for t in pending]
+    asyncio.ensure_future(asyncio.gather(*pending, return_exceptions=True))
 
 
 def main():
@@ -242,23 +250,24 @@ def main():
 
     loop = asyncio.get_event_loop()
     cache = Cache(mode=cfg.cache_delete_mode, maxsize=cfg.cache_maxsize, ttl=cfg.cache_ttl)
-    request_handler = RequestHandler(allowed_commands=cfg.commands, cache=cache,
-                                     workers=cfg.workers)
+    worker = Worker(allowed_commands=cfg.commands, cache=cache, running_limit=cfg.running_limit)
+    request_handler = RequestHandler(worker=worker)
     handler_coro = asyncio.start_unix_server(request_handler.handle, path=cfg.socket)
     server = loop.run_until_complete(handler_coro)
 
-    loop.add_signal_handler(signal.SIGTERM, partial(asyncio.ensure_future, shutdown(loop)))
+    loop.add_signal_handler(signal.SIGTERM, partial(shutdown, "TERM"))
 
     log.info("listen unix socket on %s", cfg.socket)
     try:
         loop.run_forever()
     except KeyboardInterrupt:
-        log.info("shutting down server")
-        loop.run_until_complete(loop.shutdown_asyncgens())
+        shutdown("KeyboardInterrupt")
+    finally:
+        # close the server
+        # loop.run_until_complete(loop.shutdown_asyncgens())
+        server.close()
+        loop.run_until_complete(server.wait_closed())
 
-    # close the server
-    server.close()
-    loop.run_until_complete(server.wait_closed())
     loop.close()
     os.unlink(cfg.socket)
 
