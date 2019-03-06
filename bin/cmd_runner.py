@@ -110,6 +110,14 @@ class Cache(object):
             self._remove(item)
 
 
+def limited(func):
+    async def wrap(self, *args, **kwargs):
+        self._running += 1
+        await func(self, *args, **kwargs)
+        self._running -= 1
+    return wrap
+
+
 class Worker(object):
 
     def __init__(self, cache: Cache, allowed_commands: List[str], running_limit: int):
@@ -119,17 +127,20 @@ class Worker(object):
         self._loop = asyncio.get_event_loop()
         self._running = 0
 
+    def is_limit_exceeded(self):
+        return self._running >= self.running_limit
+
     async def exec(self, cmd: str) -> Answer:
         """Validate `cmd` and execute it"""
 
         log.info("exec  : %s", cmd)
 
-        name, *args = shlex.split(cmd)
+        name, *opts = shlex.split(cmd)
         if name not in self.allowed_commands:
             log.warning("skip command '%s': not in the allowed commands list", name)
             return Answer.SKIP
 
-        if self._running >= self.running_limit:
+        if self.is_limit_exceeded():
             log.error("maximum number of running workers exceeded: %d/%d", self._running,
                       self.running_limit)
             return Answer.SKIP
@@ -141,19 +152,18 @@ class Worker(object):
             return Answer.SKIP
 
         # don't wait for complete process inside this coroutine, create another one
-        self._loop.create_task(self._wait_and_log(cmd, name, args))
+        self._loop.create_task(self._wait_and_log(cmd, name, opts))
 
         return Answer.OK
 
-    async def _wait_and_log(self, cmd, name, args) -> None:
+    @limited
+    async def _wait_and_log(self, cmd: str, name: str, opts: List[str]) -> None:
         try:
             p = await asyncio.create_subprocess_exec(
-                name, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                name, *opts, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         except Exception as err:
             log.error(err)
             return
-
-        self._running += 1
 
         self._loop.create_task(log_output(p.stdout, "stdout"))
         self._loop.create_task(log_output(p.stderr, "stderr"))
@@ -167,7 +177,6 @@ class Worker(object):
         if p.returncode != 0:
             log.error("exec  : %s failed with exit code %d", cmd, p.returncode)
         self.cache.remove(cmd)
-        self._running -= 1
 
 
 class RequestHandler(object):
