@@ -1,6 +1,10 @@
-venv:
-	virtualenv -p /usr/bin/python3 $@
+PY ?= 3
 
+# outside venv
+venv:
+	python$(PY) -m venv $@
+
+# inside venv
 .PHONY: init-dev
 init-dev:
 	pip install -U -r requirements-dev.txt

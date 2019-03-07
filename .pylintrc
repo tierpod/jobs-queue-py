@@ -1,2 +1,2 @@
 [MESSAGES CONTROL]
-disable=C0413,C0325
+disable=missing-docstring,too-few-public-methods,expression-not-assigned

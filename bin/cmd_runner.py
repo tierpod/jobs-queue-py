@@ -1,190 +1,200 @@
 #!/usr/bin/env python
 # coding: utf8
-# pylint: disable=C0111
 
 """Execute commands with limited queue.
 """
 
 import argparse
+import asyncio
 import configparser
 import logging
 import os
-import queue
 import shlex
 import signal
-import subprocess
-import threading
-from socketserver import UnixDatagramServer, DatagramRequestHandler
-
-import cachetools
+from asyncio import StreamReader, StreamWriter
+from collections import namedtuple
+from enum import Enum
+from functools import partial
+from typing import List
 
 log = logging.getLogger()
-cache = None
-cmds_queue = None
 
 DEFAULT_CFG_PATH = "/etc/cmd-runner.ini"
 
-CACHE_DELETE_EXPIRE = "expire"
-CACHE_DELETE_COMPLETE = "complete"
-CACHE_DELETE_EXPIRE_COMPLETE = "expire_complete"
+
+Command = namedtuple("Command", ["cmdline", "executable", "args"])
 
 
-def parse_args():
+class Answer(Enum):
+    OK = b"OK\n"
+    SKIP = b"SKIP\n"
+
+
+class CacheDeleteMode(Enum):
+    EXPIRE = "expire"
+    COMPLETE = "complete"
+    EXPIRE_COMPLETE = "expire_complete"
+
+
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("-c", "--config", type=str, default=DEFAULT_CFG_PATH, help="path to config file")
     return p.parse_args()
 
 
-def configure_logger(debug, datetime):
+def configure_logger(debug: bool, datetime: bool) -> logging.Logger:
     lvl = logging.DEBUG if debug else logging.INFO
 
+    fmt = "%(levelname)-7s %(message)s"
     if datetime:
-        fmt = "%(asctime)s %(threadName)-10s %(levelname)-7s %(message)s"
-    else:
-        fmt = "%(threadName)-10s %(levelname)-7s %(message)s"
+        fmt = "%(asctime)s " + fmt
 
     logging.basicConfig(format=fmt, datefmt="%Y-%m-%d/%H:%M:%S", level=lvl)
     return logging.getLogger()
 
 
-# pylint: disable=W0621,W0613
-def signal_handler(*args):
-    log.info("server shutdown")
-    exit()
+async def log_output(fh: StreamReader, prefix: str) -> None:
+    """Log output from `fh` with prefix `prefix`"""
 
-
-class RequestHandler(DatagramRequestHandler):
-    def handle(self):
-        cmd_line = self.request[0].strip().decode()
-        log.debug("got request: %s", cmd_line)
-
+    while True:
         try:
-            cmd = Command.from_str(cmd_line)
-        except ValueError as err:
-            log.error("parse data: %s", err)
-            return
-
-        if cmd.key in cache:
-            log.info("skip command: already in cache")
-            return
-
-        try:
-            cmds_queue.put(cmd, block=False, timeout=1)
-        except queue.Full:
-            log.error("queue limit is exceeded")
-            return
-
-    def finish(self):
-        """Workaround for unix socket datagram server:
-
-        self.socket.sendto(self.wfile.getvalue(), self.client_address)
-            error: [Errno 2] No such file or directory
-        """
-
-        pass
-
-
-class Worker(threading.Thread):
-    def __init__(self, name, cmds_queue, cache, cmd_list):
-        super(Worker, self).__init__(name=name)
-        self.daemon = True
-
-        log.info("start worker %s", self.name)
-        self.cmds_queue = cmds_queue
-        self.cache = cache
-        self.cmd_list = cmd_list
-
-    def run(self):
-        while True:
-            cmd = self.cmds_queue.get()
-            if cmd.executable not in self.cmd_list:
-                log.warning("skip command '%s': not in the commands list", cmd.executable)
-                return
-
-            self.cache[cmd.key] = None
-            cmd.execute()
-            del self.cache[cmd.key]
-            self.cmds_queue.task_done()
+            line = await fh.readline()
+        except asyncio.CancelledError:
+            break
+        if not line:
+            break
+        log.info("%s: %s", prefix, line.decode().strip())
 
 
 class Cache(object):
-    def __init__(self, mode, maxsize, ttl):
+    def __init__(self, mode: CacheDeleteMode, ttl: int):
         self.mode = mode
-        if mode == CACHE_DELETE_COMPLETE:
-            self.cache = cachetools.Cache(maxsize=maxsize)
-        else:
-            self.cache = cachetools.TTLCache(maxsize=maxsize, ttl=ttl)
+        self.ttl = ttl
+        self._cache: List[str] = []
+        self._loop = asyncio.get_event_loop()
 
     def __str__(self):
-        return str(self.cache)
+        return "<Cache(mode={mode} size={size})>".format(
+            mode=self.mode.value, size=len(self._cache))
 
-    def __delitem__(self, key):
-        if self.mode == CACHE_DELETE_EXPIRE:
+    def _remove(self, item):
+        if item in self._cache:
+            self._cache.remove(item)
+        log.debug("%s remove %s", self, item)
+
+    def remove(self, item):
+        # can we remove item from cache after ttl time?
+        if self.mode is CacheDeleteMode.COMPLETE or self.mode is CacheDeleteMode.EXPIRE_COMPLETE:
+            self._remove(item)
+
+    def append(self, item):
+        log.debug("%s append %s", self, item)
+        self._cache.append(item)
+        # remove item from cache later (after ttl seconds), call another coroutine
+        if self.mode is CacheDeleteMode.EXPIRE or self.mode is CacheDeleteMode.EXPIRE_COMPLETE:
+            self._loop.call_later(self.ttl, lambda: self._remove(item))
+
+    def __contains__(self, item):
+        return item in self._cache
+
+
+class RequestHandler:
+
+    def __init__(self, queue: asyncio.Queue, cache: Cache):
+        self.queue = queue
+        self.cache = cache
+
+    async def handle(self, reader: StreamReader, writer: StreamWriter) -> None:
+        raw_data = await reader.readline()
+        cmd_line = raw_data.decode().strip()
+        log.debug("got request: %s", cmd_line)
+
+        try:
+            executable, *args = shlex.split(cmd_line)
+        except ValueError as err:
+            log.error("parse data: %s", err)
+            await self.reply(writer, Answer.SKIP)
+            return
+
+        cmd = Command(cmdline=cmd_line, executable=executable, args=args)
+        if cmd.cmdline in self.cache:
+            log.info("skip command: already in cache")
+            await self.reply(writer, Answer.SKIP)
             return
 
         try:
-            self.cache.__delitem__(key)
-        except KeyError:
+            self.queue.put_nowait(cmd)
+        except asyncio.QueueFull:
+            log.error("queue limit is exceeded")
+            await self.reply(writer, Answer.SKIP)
             return
 
-    def __setitem__(self, key, value):
-        self.cache.__setitem__(key, value)
+        await self.reply(writer, Answer.OK)
 
-    def __getitem__(self, key):
-        return self.cache.__getitem__(key)
+    async def reply(self, writer: StreamWriter, answer: Answer) -> None:
+        log.debug("send reply: %s", answer)
+        writer.write(answer.value)
+        await writer.drain()
+        log.debug("close client connection")
+        writer.close()
 
-    def __contains__(self, key):
-        return self.cache.__contains__(key)
 
+class Worker:
 
-class Command(object):
-    """Args:
-        args (list of str): list of command line arguments.
+    def __init__(self, name: str, queue: asyncio.Queue, cache: Cache, allowed_commands: List[str]):
+        self.name = name
+        self.queue = queue
+        self.cache = cache
+        self.allowed_commands = allowed_commands
+        self.shutdown = asyncio.Event()
+        self._loop = asyncio.get_event_loop()
 
-    >>> cmd = Command.from_str("/bin/sleep 10")
-    >>> print(cmd)
-    Command(executable=/bin/sleep args=['/bin/sleep', '10'])
-    """
+    async def run(self) -> None:
+        log.info("(%s) start worker", self.name)
+        while not self.shutdown.is_set():
+            cmd = await self.queue.get()
+            if cmd.executable not in self.allowed_commands:
+                log.warning("(%s) skip '%s': not in the commands list", self.name, cmd.executable)
+                continue
 
-    def __init__(self, args):
-        self.executable = args[0]
-        self.args = args
+            self.cache.append(cmd.cmdline)
+            await self.exec(cmd)
+            self.cache.remove(cmd.cmdline)
+            self.queue.task_done()
+        log.debug("(%s) worker stopped", self.name)
 
-    def __str__(self):
-        return "Command(executable={} args={})".format(self.executable, self.args)
+    def stop(self) -> None:
+        self.shutdown.set()
 
-    @property
-    def key(self):
-        return "{}".format(" ".join(self.args))
+    async def exec(self, cmd: Command) -> None:
+        log.info("(%s) exec  : %s", self.name, cmd.cmdline)
+        try:
+            p = await asyncio.create_subprocess_exec(
+                cmd.executable, *cmd.args,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            log.error(err)
+            return
 
-    def execute(self):
-        log.info("exec  : %s", self.args)
-        p = subprocess.Popen(self.args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8")
-        (stdout, stderr) = p.communicate()
+        self._loop.create_task(log_output(p.stdout, f"({self.name}) stdout"))
+        self._loop.create_task(log_output(p.stderr, f"({self.name}) stderr"))
 
-        for line in stdout.split("\n"):
-            if line:
-                log.info("stdout: %s", line)
-
-        for line in stderr.split("\n"):
-            if line:
-                log.info("stderr: %s", line)
-
+        try:
+            await p.wait()
+        except asyncio.CancelledError:
+            p.terminate()
+            log.info("(%s) subprocess pid=%d was terminated", self.name, p.pid)
+            return
         if p.returncode != 0:
-            log.error("exec  : %s failed with %d", self.args, p.returncode)
-
-    @classmethod
-    def from_str(cls, s):
-        cmd = shlex.split(s)
-        if not cmd:
-            raise ValueError("unable to parse data")
-
-        return cls(args=cmd)
+            log.error("(%s) exec  : %s failed with exit code %d", self.name, cmd.cmdline,
+                      p.returncode)
 
 
 class Config(object):
-    def __init__(self, socket, workers, log_debug, log_datetime, queue_size, cache_delete_mode,
-                 cache_expire, commands):
+    def __init__(self, socket: str, workers: int, log_debug: bool, log_datetime: bool,
+                 queue_size: int, cache_delete_mode: CacheDeleteMode, cache_expire: int,
+                 commands: List[str]):
         self.socket = socket
         self.workers = workers
         self.log_debug = log_debug
@@ -195,13 +205,10 @@ class Config(object):
         self.commands = commands
 
     @classmethod
-    def from_file(cls, path):
+    def from_file(cls, path: str) -> "Config":
         c = configparser.ConfigParser(allow_no_value=True)
         c.read(path)
-        cache_delete_mode = c.get("main", "cache_delete_mode")
-        if cache_delete_mode not in (CACHE_DELETE_EXPIRE, CACHE_DELETE_COMPLETE,
-                                     CACHE_DELETE_EXPIRE_COMPLETE):
-            raise ValueError("wrong cache_delete_mode value")
+        cache_delete_mode = CacheDeleteMode(c.get("main", "cache_delete_mode"))
 
         commands = []
         for k, _ in c.items("commands"):
@@ -222,6 +229,18 @@ class Config(object):
         )
 
 
+def shutdown(signame: str, workers: List[Worker]) -> None:
+    log.info("server shutdown (%s)", signame)
+    loop = asyncio.get_event_loop()
+    loop.stop()
+    # stop all running workers
+    [w.stop() for w in workers]
+    # stop all pending coroutines
+    pending = asyncio.Task.all_tasks()
+    [t.cancel() for t in pending]
+    asyncio.ensure_future(asyncio.gather(*pending, return_exceptions=True))
+
+
 def main():
     args = parse_args()
     config = Config.from_file(args.config)
@@ -229,30 +248,35 @@ def main():
     global log  # pylint: disable=W0603
     log = configure_logger(config.log_debug, config.log_datetime)
 
-    log.debug("load configuration from %s, %d commands loaded", args.config, len(config.commands))
+    log.info("load configuration from %s, %d commands loaded", args.config, len(config.commands))
 
-    signal.signal(signal.SIGTERM, signal_handler)
+    loop = asyncio.get_event_loop()
+    cache = Cache(mode=config.cache_delete_mode, ttl=config.cache_expire)
+    queue = asyncio.Queue(maxsize=config.queue_size)
+    request_handler = RequestHandler(queue=queue, cache=cache)
 
-    global cache  # pylint: disable=W0603
-    cache = Cache(mode=config.cache_delete_mode, maxsize=config.queue_size, ttl=config.cache_expire)
+    # start asynchronous workers
+    workers = []
+    for i in range(config.workers):
+        w = Worker(name=f"wrk{i+1}", allowed_commands=config.commands, cache=cache, queue=queue)
+        loop.create_task(w.run())
+        workers.append(w)
 
-    global cmds_queue  # pylint: disable=W0603
-    cmds_queue = queue.Queue(maxsize=config.queue_size)
+    # start asynchronous server
+    handler_coro = asyncio.start_unix_server(request_handler.handle, path=config.socket)
+    server = loop.run_until_complete(handler_coro)
 
-    for i in range(1, config.workers + 1):
-        worker = Worker(name="Worker-%d" % i, cmds_queue=cmds_queue, cache=cache,
-                        cmd_list=config.commands)
-        worker.start()
+    loop.add_signal_handler(signal.SIGTERM, partial(shutdown, "TERM", workers))
 
     log.info("listen unix socket on %s", config.socket)
-    server = UnixDatagramServer(config.socket, RequestHandler)
-
     try:
-        server.serve_forever()
+        loop.run_forever()
     except KeyboardInterrupt:
-        log.info("shutting down server")
-        exit(0)
+        shutdown("KeyboardInterrupt", workers)
     finally:
+        server.close()
+        loop.run_until_complete(server.wait_closed())
+        loop.close()
         os.unlink(config.socket)
 
 
